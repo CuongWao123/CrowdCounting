@@ -2,28 +2,57 @@
 Training script for SANet - Theo đúng paper ECCV 2018
 Paper: Scale Aggregation Network for Accurate and Efficient Crowd Counting
 
-Training Details từ Paper:
+Training Details từ Paper (Section 4.1):
 - Patch size: 1/4 original image (H/2, W/2)
-- Data augmentation: Random crop + horizontal flip (p=0.5)
-- Density map: Fixed Gaussian σ = 8 (not geometry-adaptive)
+- Data augmentation: Random crop + horizontal flip + gray scale + random brightness
+- Density map: Fixed Gaussian σ = 4 (paper Section 4.1 states "σ=4")
 - Optimizer: Adam, lr = 1e-5, weight_decay = 0
 - Weight init: Gaussian(mean=0, std=0.01)
 - Loss: L_E (MSE) + α_c * L_C (SSIM), α_c = 1e-3, win_size=11, σ_ssim=1.5
 - Evaluation: Tiled inference với 50% overlap
 """
 
-import os, math, argparse
+import os, math, argparse, time
+import psutil  # For CPU & RAM monitoring
+from datetime import datetime, timedelta
 import numpy as np
 import cv2
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from network import SANet
+from network import SANet, SANetLoss
 from utils import (
     set_seed, list_image_mat_pairs, load_points_from_mat,
-    tile_infer_patch_quarter, CrowdPatchDataset, SANetLoss
+    tile_infer_patch_quarter, CrowdPatchDataset
 )
+
+def get_gpu_memory_info():
+    """Get current GPU memory usage in MB"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**2  # MB
+        reserved = torch.cuda.memory_reserved() / 1024**2  # MB
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**2  # MB
+        return {
+            'allocated': allocated,
+            'reserved': reserved,
+            'max_allocated': max_allocated
+        }
+    return {'allocated': 0, 'reserved': 0, 'max_allocated': 0}
+
+def get_system_info():
+    """Get CPU and RAM usage"""
+    cpu_percent = psutil.cpu_percent(interval=0.1)
+    ram = psutil.virtual_memory()
+    ram_used_gb = ram.used / 1024**3
+    ram_total_gb = ram.total / 1024**3
+    ram_percent = ram.percent
+    return {
+        'cpu_percent': cpu_percent,
+        'ram_used_gb': ram_used_gb,
+        'ram_total_gb': ram_total_gb,
+        'ram_percent': ram_percent
+    }
 
 def evaluate_full_images(model, pairs, device='cuda'):
     mae, se = 0.0, 0.0
@@ -41,6 +70,7 @@ def evaluate_full_images(model, pairs, device='cuda'):
             mae += abs(C_pred - C_gt)
             se += (C_pred - C_gt) ** 2
     N = max(1, len(pairs))
+    print(N)
     return {'MAE': mae / N, 'MSE': math.sqrt(se / N)}
 
 def train(args):
@@ -67,15 +97,18 @@ def train(args):
         drop_last=True
     )
     
-    # Model
+    # Model - Tăng channels theo paper
     print("\n=== Initializing Model ===")
-    model = SANet().to(device)
+    model = SANet(sa_channels=(64, 128, 256, 512)).to(device)  # ← TĂNG CHANNELS
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")
     
-    # Loss & Optimizer (theo paper)
-    criterion = SANetLoss(alpha_c=1e-3, win_size=11, sigma=1.5)
+    # Loss & Optimizer (theo paper + count loss)
+    criterion = SANetLoss(alpha=1e-3, beta=1e-3, window_size=11, sigma=1.5)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0)
+    
+    print(f"Loss: MSE + {1e-3}*SSIM + {1e-3}*Count")
+    print(f"Optimizer: Adam(lr={args.lr})")
     
     # AMP (optional)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device == 'cuda')
@@ -97,8 +130,16 @@ def train(args):
     # Logging
     os.makedirs(args.out_dir, exist_ok=True)
     log_file = os.path.join(args.out_dir, 'train_log.txt')
+    monitor_file = os.path.join(args.out_dir, 'system_monitor.txt')
+    
+    # Create log file with headers
     with open(log_file, 'w') as f:
-        f.write("Epoch\tLoss\tLE\tLC\tValMAE\tValMSE\n")
+        f.write("Epoch\tLoss\tValMAE\tValMSE\tEpochTime(s)\tGPU_Mem(MB)\tRAM(%)\n")
+    
+    # Create monitor file with headers
+    with open(monitor_file, 'w') as f:
+        f.write("Epoch\tEpochTime(s)\tGPU_Alloc(MB)\tGPU_Reserved(MB)\tGPU_Max(MB)\t")
+        f.write("CPU(%)\tRAM_Used(GB)\tRAM_Total(GB)\tRAM(%)\tLR\n")
     
     # TensorBoard (optional)
     tb_writer = None
@@ -111,9 +152,18 @@ def train(args):
             print("[WARN] TensorBoard not available")
     
     # Training Loop
-    print(f"\n=== Training from epoch {start_epoch} to {args.epochs} ===\n")
+    print(f"\n=== Training from epoch {start_epoch} to {args.epochs} ===")
+    if args.epoch_delay > 0:
+        print(f"⚡ Energy Saving Mode: {args.epoch_delay}s delay after each epoch\n")
+    else:
+        print()
+    
+    # Training start time
+    training_start_time = time.time()
     
     for epoch in range(start_epoch, args.epochs + 1):
+        epoch_start_time = time.time()
+        
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
         
@@ -132,7 +182,7 @@ def train(args):
             if args.amp and device == 'cuda':
                 with torch.cuda.amp.autocast():
                     pred = model(img)
-                    loss, parts = criterion(pred, dm)
+                    loss = criterion(pred, dm)
                 scaler.scale(loss).backward()
                 
                 # Gradient clipping
@@ -144,7 +194,7 @@ def train(args):
                 scaler.update()
             else:
                 pred = model(img)
-                loss, parts = criterion(pred, dm)
+                loss = criterion(pred, dm)
                 loss.backward()
                 
                 # Gradient clipping
@@ -155,11 +205,9 @@ def train(args):
             
             # Stats
             epoch_loss += loss.item()
-            epoch_le += parts['LE']
-            epoch_lc += parts['LC']
             n_batches += 1
             
-            # Debug: track prediction stats
+            # Track prediction stats
             with torch.no_grad():
                 pred_count = pred.sum().item()
                 gt_count = dm.sum().item()
@@ -167,15 +215,18 @@ def train(args):
             # Progress bar
             pbar.set_postfix({
                 'Loss': f"{epoch_loss/n_batches:.4f}",
-                'LE': f"{epoch_le/n_batches:.4f}",
-                'LC': f"{epoch_lc/n_batches:.4f}",
-                'PredC': f"{pred_count:.1f}",
-                'GTC': f"{gt_count:.1f}"
+                'Pred': f"{pred_count:.1f}",
+                'GT': f"{gt_count:.1f}"
             })
         
         avg_loss = epoch_loss / n_batches
-        avg_le = epoch_le / n_batches
-        avg_lc = epoch_lc / n_batches
+        
+        # Epoch time
+        epoch_time = time.time() - epoch_start_time
+        
+        # Get system metrics
+        gpu_mem = get_gpu_memory_info()
+        sys_info = get_system_info()
         
         # Evaluation
         val_mae = val_mse = None
@@ -199,16 +250,35 @@ def train(args):
                 }, best_path)
                 print(f"✓ Saved best model (MAE={best_mae:.2f})")
         
-        # Logging
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Logging to train_log.txt
         with open(log_file, 'a') as f:
-            f.write(f"{epoch}\t{avg_loss:.6f}\t{avg_le:.6f}\t{avg_lc:.6f}\t")
-            f.write(f"{val_mae if val_mae else 'N/A'}\t{val_mse if val_mse else 'N/A'}\n")
+            f.write(f"{epoch}\t{avg_loss:.6f}\t")
+            f.write(f"{val_mae if val_mae else 'N/A'}\t{val_mse if val_mse else 'N/A'}\t")
+            f.write(f"{epoch_time:.2f}\t{gpu_mem['allocated']:.1f}\t{sys_info['ram_percent']:.1f}\n")
+        
+        # Logging to system_monitor.txt (detailed)
+        with open(monitor_file, 'a') as f:
+            f.write(f"{epoch}\t{epoch_time:.2f}\t")
+            f.write(f"{gpu_mem['allocated']:.1f}\t{gpu_mem['reserved']:.1f}\t{gpu_mem['max_allocated']:.1f}\t")
+            f.write(f"{sys_info['cpu_percent']:.1f}\t{sys_info['ram_used_gb']:.2f}\t")
+            f.write(f"{sys_info['ram_total_gb']:.2f}\t{sys_info['ram_percent']:.1f}\t{current_lr:.2e}\n")
+        
+        # Console summary
+        elapsed_time = time.time() - training_start_time
+        eta = (elapsed_time / (epoch - start_epoch + 1)) * (args.epochs - epoch) if epoch > start_epoch else 0
+        print(f"\n[Epoch {epoch}] Time: {epoch_time:.1f}s | GPU: {gpu_mem['allocated']:.0f}MB | RAM: {sys_info['ram_percent']:.1f}% | ETA: {timedelta(seconds=int(eta))}")
         
         # TensorBoard
         if tb_writer:
             tb_writer.add_scalar('Loss/train', avg_loss, epoch)
-            tb_writer.add_scalar('Loss/LE', avg_le, epoch)
-            tb_writer.add_scalar('Loss/LC', avg_lc, epoch)
+            tb_writer.add_scalar('System/GPU_Memory_MB', gpu_mem['allocated'], epoch)
+            tb_writer.add_scalar('System/RAM_Percent', sys_info['ram_percent'], epoch)
+            tb_writer.add_scalar('System/CPU_Percent', sys_info['cpu_percent'], epoch)
+            tb_writer.add_scalar('System/Epoch_Time_Sec', epoch_time, epoch)
+            tb_writer.add_scalar('Training/Learning_Rate', current_lr, epoch)
             if val_mae:
                 tb_writer.add_scalar('MAE/val', val_mae, epoch)
                 tb_writer.add_scalar('MSE/val', val_mse, epoch)
@@ -223,13 +293,32 @@ def train(args):
                 'best_mae': best_mae
             }, ckpt_path)
             print(f"✓ Saved checkpoint at epoch {epoch}")
+        
+        # GPU Cooling / Energy Saving Delay
+        if args.epoch_delay > 0:
+            time.sleep(args.epoch_delay)
+            # Clear GPU cache to reduce temperature
+            if device == 'cuda':
+                torch.cuda.empty_cache()
     
     if tb_writer:
         tb_writer.close()
     
+    # Final statistics
+    total_training_time = time.time() - training_start_time
+    final_gpu_mem = get_gpu_memory_info()
+    final_sys_info = get_system_info()
+    
     print(f"\n=== Training Complete ===")
     print(f"Best MAE: {best_mae:.2f}")
+    print(f"Total Training Time: {timedelta(seconds=int(total_training_time))}")
+    print(f"Average Time/Epoch: {total_training_time/(args.epochs - start_epoch + 1):.1f}s")
+    print(f"Peak GPU Memory: {final_gpu_mem['max_allocated']:.1f} MB")
+    print(f"Final GPU Memory: {final_gpu_mem['allocated']:.1f} MB")
+    print(f"Final RAM Usage: {final_sys_info['ram_used_gb']:.2f}/{final_sys_info['ram_total_gb']:.2f} GB ({final_sys_info['ram_percent']:.1f}%)")
     print(f"Models saved in: {args.out_dir}")
+    print(f"Logs saved in: {log_file}")
+    print(f"System monitor saved in: {monitor_file}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train SANet (ECCV 2018)')
@@ -240,12 +329,16 @@ def parse_args():
     parser.add_argument('--val-images', type=str, required=True, help='Path to validation images')
     parser.add_argument('--val-gts', type=str, required=True, help='Path to validation ground truth')
     
-    # Training params (theo paper)
+    # Training params (theo paper - CHÍNH XÁC)
     parser.add_argument('--epochs', type=int, default=300, help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=1, help='Batch size (1 for variable patch sizes)')
     parser.add_argument('--lr', type=float, default=1e-5, help='Learning rate (paper: 1e-5)')
-    parser.add_argument('--sigma', type=float, default=8.0, help='Gaussian sigma for density map (paper: 8)')
+    parser.add_argument('--sigma', type=float, default=4.0, help='Gaussian sigma for density map (paper Section 4.1: σ=4)')
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping value (0 to disable)')
+    
+    # GPU Cooling / Energy Saving
+    parser.add_argument('--epoch-delay', type=float, default=0.0, 
+                       help='Delay (seconds) after each epoch to cool GPU and save energy (e.g., 3.0)')
     
     # System
     parser.add_argument('--workers', type=int, default=4, help='Number of data loading workers')
